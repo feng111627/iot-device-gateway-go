@@ -1,10 +1,6 @@
 package gateway
 
-import (
-	"encoding/json"
-	"os"
-	"sync"
-)
+import "sync"
 
 // OfflineQueue 是单设备的离线暂存队列，容量有限。
 // 淘汰策略：队列满时丢弃最旧消息（确定性、可解释：保护最新数据）。
@@ -56,23 +52,16 @@ func (q *OfflineQueue) Evicted() int {
 	return q.evicted
 }
 
-// snapshotRecord 是持久化到磁盘的记录格式。
-type snapshotRecord struct {
-	DeviceID string  `json:"device_id"`
-	Messages []Message `json:"messages"`
-}
-
 // OfflineStore 管理所有设备的离线队列，并支持快照持久化以应对网关重启。
 // 每个设备独立队列：个别设备堵塞（队列满）不影响其他设备的暂存与收发。
 type OfflineStore struct {
 	mu     sync.Mutex
 	queues map[string]*OfflineQueue
 	cap    int
-	path   string // 快照文件路径，空表示不持久化
 }
 
-func NewOfflineStore(capacity int, snapshotPath string) *OfflineStore {
-	return &OfflineStore{queues: make(map[string]*OfflineQueue), cap: capacity, path: snapshotPath}
+func NewOfflineStore(capacity int) *OfflineStore {
+	return &OfflineStore{queues: make(map[string]*OfflineQueue), cap: capacity}
 }
 
 func (s *OfflineStore) queue(deviceID string) *OfflineQueue {
@@ -124,70 +113,84 @@ func (s *OfflineStore) Evicted(deviceID string) int {
 	return q.Evicted()
 }
 
-// Snapshot 将全部暂存原子写入磁盘（先写临时文件再重命名，避免抖动时写坏）。
-func (s *OfflineStore) Snapshot() error {
-	if s.path == "" {
-		return nil
-	}
+// snapshotDevice 导出单设备离线暂存片段（保持入队顺序）。
+func (s *OfflineStore) snapshotDevice(deviceID string, st *deviceState) {
 	s.mu.Lock()
-	recs := make([]snapshotRecord, 0, len(s.queues))
-	for id, q := range s.queues {
-		q.mu.Lock()
-		msgs := make([]Message, len(q.msgs))
-		copy(msgs, q.msgs)
-		q.mu.Unlock()
-		recs = append(recs, snapshotRecord{DeviceID: id, Messages: msgs})
-	}
+	q, ok := s.queues[deviceID]
 	s.mu.Unlock()
-
-	data, err := json.Marshal(recs)
-	if err != nil {
-		return err
+	if !ok {
+		return
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, s.path)
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	st.Offline = make([]Message, len(q.msgs))
+	copy(st.Offline, q.msgs)
+	st.Evicted = q.evicted
 }
 
-// Restore 从磁盘恢复快照。恢复以"消息 ID 去重"的方式合并：
-// 重复恢复或快照与内存重叠时不会产生重复消息，也不会整批丢失。
-func (s *OfflineStore) Restore() error {
-	if s.path == "" {
-		return nil
-	}
-	data, err := os.ReadFile(s.path)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	var recs []snapshotRecord
-	if err := json.Unmarshal(data, &recs); err != nil {
-		return err
-	}
+// restoreDevice 幂等恢复单设备离线暂存：按消息 ID 去重合并，保持原先后顺序；
+// 合并后若超出容量，按与运行时一致的"淘汰最旧、保护最新"策略只留最新若干条，
+// 被淘汰条数计入 blocked；重复恢复不产生重复。
+func (s *OfflineStore) restoreDevice(st deviceState) (restored, blocked int) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, rec := range recs {
-		q := s.queue(rec.DeviceID)
-		q.mu.Lock()
-		seen := make(map[string]bool, len(q.msgs))
-		for _, m := range q.msgs {
-			seen[m.ID] = true
-		}
-		for _, m := range rec.Messages {
-			if seen[m.ID] {
-				continue // 已在内存中，跳过避免重复下发
-			}
-			if q.capacity > 0 && len(q.msgs) >= q.capacity {
-				continue // 恢复同样受容量约束，超出部分视为已被淘汰
-			}
-			q.msgs = append(q.msgs, m)
-			seen[m.ID] = true
-		}
-		q.mu.Unlock()
+	q := s.queue(st.DeviceID)
+	s.mu.Unlock()
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	// 恢复会同时重建历史淘汰计数（快照内的淘汰数是权威累计值，取较大值防回退）。
+	if st.Evicted > q.evicted {
+		q.evicted = st.Evicted
 	}
-	return nil
+	// 先记录恢复前已在内存中的消息，便于区分"本次新装入"与"幂等命中"。
+	before := make(map[string]bool, len(q.msgs))
+	merged := make([]Message, 0, len(q.msgs)+len(st.Offline))
+	seen := make(map[string]bool, len(q.msgs)+len(st.Offline))
+	for _, m := range q.msgs {
+		before[m.ID] = true
+		seen[m.ID] = true
+		merged = append(merged, m)
+	}
+	newFromSnapshot := make([]Message, 0, len(st.Offline))
+	for _, m := range st.Offline {
+		if m.ID == "" || seen[m.ID] {
+			continue
+		}
+		seen[m.ID] = true
+		merged = append(merged, m)
+		newFromSnapshot = append(newFromSnapshot, m)
+	}
+	// 合并后超容量：按运行时一致的策略淘汰最旧、保留最新。
+	if q.capacity > 0 && len(merged) > q.capacity {
+		merged = merged[len(merged)-q.capacity:]
+	}
+	surviving := make(map[string]bool, len(merged))
+	for _, m := range merged {
+		surviving[m.ID] = true
+	}
+	for _, m := range newFromSnapshot {
+		if surviving[m.ID] {
+			restored++
+		} else {
+			blocked++
+			q.evicted++ // 与运行时淘汰共用同一累计观测口径
+		}
+	}
+	q.msgs = merged
+	return restored, blocked
+}
+
+// wipe 清空指定设备的全部离线暂存与淘汰计数（换新身份时使用）：
+// 新身份看到的应是一块完全干净的暂存，旧会话统计也不得残留。
+func (s *OfflineStore) wipe(deviceID string) {
+	s.mu.Lock()
+	q, ok := s.queues[deviceID]
+	s.mu.Unlock()
+	if !ok {
+		return
+	}
+	q.mu.Lock()
+	q.msgs = nil
+	q.evicted = 0
+	q.mu.Unlock()
 }

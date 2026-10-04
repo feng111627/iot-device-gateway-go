@@ -7,14 +7,15 @@ import "fmt"
 type ErrCode string
 
 const (
-	ErrCodeUnknownDevice     ErrCode = "UNKNOWN_DEVICE"      // 设备未接入
-	ErrCodeSessionExpired    ErrCode = "SESSION_EXPIRED"     // 会话已失效（凭据变更或被清理）
-	ErrCodeWindowFull        ErrCode = "WINDOW_FULL"         // 超出确认窗口
-	ErrCodeQuotaExceeded     ErrCode = "QUOTA_EXCEEDED"      // 超出配额
-	ErrCodeDuplicateAck      ErrCode = "DUPLICATE_ACK"       // 重复确认
-	ErrCodeUnknownMessage    ErrCode = "UNKNOWN_MESSAGE"     // 确认不存在的消息
-	ErrCodeOfflineQueueFull  ErrCode = "OFFLINE_QUEUE_FULL"  // 离线暂存已满（新消息被淘汰）
-	ErrCodeNotConnected      ErrCode = "NOT_CONNECTED"       // 设备不在线
+	ErrCodeUnknownDevice    ErrCode = "UNKNOWN_DEVICE"     // 设备未接入
+	ErrCodeSessionExpired   ErrCode = "SESSION_EXPIRED"    // 会话已失效（凭据变更或被清理）
+	ErrCodeWindowFull       ErrCode = "WINDOW_FULL"        // 超出确认窗口
+	ErrCodeQuotaExceeded    ErrCode = "QUOTA_EXCEEDED"     // 超出配额
+	ErrCodeDuplicateAck     ErrCode = "DUPLICATE_ACK"      // 重复确认
+	ErrCodeUnknownMessage   ErrCode = "UNKNOWN_MESSAGE"    // 确认不存在的消息
+	ErrCodeOfflineQueueFull ErrCode = "OFFLINE_QUEUE_FULL" // 离线暂存已满（新消息被淘汰）
+	ErrCodeNotConnected     ErrCode = "NOT_CONNECTED"      // 设备不在线
+	ErrCodeDeviceLimit      ErrCode = "DEVICE_LIMIT"       // 网关注册设备数达容量上限
 )
 
 // Error 是可区分原因的业务错误。
