@@ -20,9 +20,19 @@ func NewOfflineQueue(capacity int) *OfflineQueue {
 }
 
 // Enqueue 暂存消息；满时淘汰最旧消息并返回被淘汰者（未满时返回 nil）。
+// 同一消息 ID 已在队列中时跳过（幂等，保证跨重启/重放不重复）。
 func (q *OfflineQueue) Enqueue(m Message) (evicted *Message) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	return q.enqueueLocked(m)
+}
+
+func (q *OfflineQueue) enqueueLocked(m Message) (evicted *Message) {
+	for _, ex := range q.msgs {
+		if ex.ID == m.ID {
+			return nil // 幂等：重复 ID 不再入队、不触发淘汰
+		}
+	}
 	if q.capacity > 0 && len(q.msgs) >= q.capacity {
 		old := q.msgs[0]
 		q.msgs = q.msgs[1:]
@@ -31,6 +41,46 @@ func (q *OfflineQueue) Enqueue(m Message) (evicted *Message) {
 	}
 	q.msgs = append(q.msgs, m)
 	return evicted
+}
+
+// snapshotLocked 导出队列持久化状态（调用方持锁）。
+type queueSnapshot struct {
+	Msgs    []Message `json:"messages"`
+	Evicted int       `json:"evicted"`
+}
+
+func (q *OfflineQueue) snapshotState() queueSnapshot {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	out := queueSnapshot{Msgs: make([]Message, len(q.msgs)), Evicted: q.evicted}
+	copy(out.Msgs, q.msgs)
+	return out
+}
+
+func (q *OfflineQueue) materializeState(snap queueSnapshot) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.msgs = make([]Message, len(snap.Msgs))
+	copy(q.msgs, snap.Msgs)
+	q.evicted = snap.Evicted
+}
+
+// removeLocked 按消息 ID 移除队列中的消息（drain 事件重放，幂等）。
+func (q *OfflineQueue) removeLocked(ids map[string]bool) int {
+	if len(ids) == 0 || len(q.msgs) == 0 {
+		return 0
+	}
+	kept := q.msgs[:0]
+	removed := 0
+	for _, m := range q.msgs {
+		if ids[m.ID] {
+			removed++
+			continue
+		}
+		kept = append(kept, m)
+	}
+	q.msgs = kept
+	return removed
 }
 
 // Drain 取出全部暂存消息（保持入队顺序），用于设备上线后的补投。
@@ -58,7 +108,7 @@ func (q *OfflineQueue) Evicted() int {
 
 // snapshotRecord 是持久化到磁盘的记录格式。
 type snapshotRecord struct {
-	DeviceID string  `json:"device_id"`
+	DeviceID string    `json:"device_id"`
 	Messages []Message `json:"messages"`
 }
 
@@ -84,11 +134,94 @@ func (s *OfflineStore) queue(deviceID string) *OfflineQueue {
 	return q
 }
 
-// Enqueue 为设备暂存一条消息。
+// Enqueue 为设备暂存一条消息（幂等：重复 ID 不重复入队）。
 func (s *OfflineStore) Enqueue(deviceID string, m Message) (evicted *Message) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.queue(deviceID).Enqueue(m)
+}
+
+// ApplyEnqueue 重放 enqueue 事件：受容量约束，超出部分确定性淘汰最旧，
+// 返回该设备累计淘汰数，便于恢复统计。
+func (s *OfflineStore) ApplyEnqueue(deviceID string, m Message) (evictedTotal int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	q := s.queue(deviceID)
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.enqueueLocked(m)
+	return q.evicted
+}
+
+// ApplyDrain 重放 drain 事件：按 ID 幂等移除消息。
+func (s *OfflineStore) ApplyDrain(deviceID string, ids []string) int {
+	set := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		set[id] = true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	q, ok := s.queues[deviceID]
+	if !ok {
+		return 0
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.removeLocked(set)
+}
+
+// SnapshotDevice 导出单设备队列的持久化状态。
+func (s *OfflineStore) SnapshotDevice(deviceID string) *queueSnapshot {
+	s.mu.Lock()
+	q, ok := s.queues[deviceID]
+	s.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	snap := q.snapshotState()
+	return &snap
+}
+
+// MaterializeDevice 从快照装载单设备队列（恢复用）。
+func (s *OfflineStore) MaterializeDevice(deviceID string, snap queueSnapshot) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.queue(deviceID).materializeState(snap)
+}
+
+// PrependFront 将若干消息按原顺序放回队首（补投中断后把未处理部分还回暂存）。
+// 仅放入队列中不存在的 ID（幂等）；容量不足时最旧消息被确定性淘汰。
+func (s *OfflineStore) PrependFront(deviceID string, msgs []Message) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	q := s.queue(deviceID)
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	have := make(map[string]bool, len(q.msgs))
+	for _, m := range q.msgs {
+		have[m.ID] = true
+	}
+	prepend := make([]Message, 0, len(msgs))
+	for _, m := range msgs {
+		if have[m.ID] {
+			continue
+		}
+		prepend = append(prepend, m)
+		have[m.ID] = true
+	}
+	q.msgs = append(prepend, q.msgs...)
+	// 容量约束：超限时淘汰最旧（队列尾部的最旧元素，即 prepend 之前原有的）
+	for q.capacity > 0 && len(q.msgs) > q.capacity {
+		q.msgs = q.msgs[:len(q.msgs)-1]
+		q.evicted++
+	}
+}
+
+// ResetDevice 清空单设备队列与淘汰计数（换新身份用）。
+func (s *OfflineStore) ResetDevice(deviceID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.queues, deviceID)
 }
 
 // Drain 取出并清空设备的暂存消息。

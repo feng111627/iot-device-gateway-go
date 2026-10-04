@@ -130,7 +130,7 @@ func TestSession_GracefulVsCleared(t *testing.T) {
 }
 
 func TestSession_CredentialChangeInvalidatesOldMessages(t *testing.T) {
-	t.Log("场景: 设备换新凭据后，旧会话下的暂存与未确认消息不再下发")
+	t.Log("场景: 设备显式换新身份（ResetIdentity）后，旧会话下的暂存与未确认消息不再下发")
 	g := New(testConfig())
 	mustConnect(t, g, "dev1", "cred-OLD")
 	if err := g.Subscribe("dev1", "t/old"); err != nil {
@@ -141,16 +141,23 @@ func TestSession_CredentialChangeInvalidatesOldMessages(t *testing.T) {
 	g.Disconnect("dev1", false)
 	mustPublish(t, g, "dev1", "m-old-offline") // 离线暂存
 
-	// 换凭据重连
-	mustConnect(t, g, "dev1", "cred-NEW")
-	if got := g.Subscriptions("dev1"); len(got) != 0 {
-		t.Fatalf("换凭据后旧订阅应失效，实际: %v", got)
+	// 直接用新凭据 Connect 必须被拒绝，逼调用方显式选择语义
+	_, err := g.Connect("dev1", "cred-NEW")
+	assertErrCode(t, err, ErrCodeCredentialMismatch)
+
+	// 显式换新身份
+	if _, err := g.ResetIdentity("dev1", "cred-NEW"); err != nil {
+		t.Fatalf("ResetIdentity 失败: %v", err)
 	}
+	if got := g.Subscriptions("dev1"); len(got) != 0 {
+		t.Fatalf("换新身份后旧订阅应失效，实际: %v", got)
+	}
+	mustConnect(t, g, "dev1", "cred-NEW")
 	if ds := mustReceive(t, g, "dev1"); len(ds) != 0 {
-		t.Fatalf("换凭据后不应收到旧会话消息，实际: %v", msgIDs(ds))
+		t.Fatalf("换新身份后不应收到旧会话消息，实际: %v", msgIDs(ds))
 	}
 	if n := g.OfflineLen("dev1"); n != 0 {
-		t.Fatalf("换凭据后旧暂存应作废，实际剩余 %d", n)
+		t.Fatalf("换新身份后旧暂存应作废，实际剩余 %d", n)
 	}
 	t.Log("旧会话消息与订阅对新身份完全不可见 ✓")
 }
