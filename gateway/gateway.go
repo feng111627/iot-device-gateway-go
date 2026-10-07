@@ -10,6 +10,7 @@ type Config struct {
 	AckWindow    int    // 单设备确认窗口（未确认消息上限）
 	Quota        int    // 单设备周期内下发配额
 	OfflineCap   int    // 单设备离线暂存上限
+	ConsumedCap  int    // 单设备"已消费"去重记录保留上限，<=0 表示不限；超限确定性淘汰 Seq 最小（最旧）的记录
 	SnapshotPath string // （兼容）旧版离线暂存全量快照路径
 	StateDir     string // 设备持久状态目录（WAL+快照），空则纯内存
 	MaxDevices   int    // 恢复/持久化的设备数容量边界，<=0 表示不限
@@ -56,10 +57,17 @@ func New(cfg Config) *Gateway {
 	}
 }
 
+// newTracker 创建按当前配置（窗口/配额/去重保留上限）装配好的投递跟踪器。
+func (g *Gateway) newTracker() *deliveryTracker {
+	t := newDeliveryTracker(g.cfg.AckWindow, g.cfg.Quota)
+	t.setConsumedCap(g.cfg.ConsumedCap)
+	return t
+}
+
 func (g *Gateway) tracker(deviceID string) *deliveryTracker {
 	t, ok := g.trackers[deviceID]
 	if !ok {
-		t = newDeliveryTracker(g.cfg.AckWindow, g.cfg.Quota)
+		t = g.newTracker()
 		g.trackers[deviceID] = t
 	}
 	return t
@@ -120,8 +128,13 @@ func (g *Gateway) push(deviceID string, m Message) {
 
 // resumeLocked 在设备连接（含恢复后的重连）时：重传在途消息、补投离线暂存，
 // 每一步都先落盘（assign/drain），保证该过程被强杀后仍可接着恢复、不重不丢。
+//
+// 新连接建立即作废旧连接遗留的待取投递：那些投递从未被设备取走，对应消息
+// 仍在在途窗口中，由下面的重传统一覆盖——否则同一批消息会在 inbox 里出现
+// 两份（旧连接残留 + 新连接重传），顺序也被打乱。
 func (g *Gateway) resumeLocked(sess *Session) {
 	deviceID := sess.DeviceID
+	delete(g.inbox, deviceID)
 	t := g.tracker(deviceID)
 	// 1. 重传窗口内未确认的消息（顺序稳定）。重传不落新事件：assign 事件已在
 	// 落盘，Attempt 只是瞬时投递计数，重启后由持久化的 attempts 接续。
@@ -200,8 +213,16 @@ func (g *Gateway) Connect(deviceID, credential string) (*Session, error) {
 
 // Disconnect 设备断开。graceful=true 为正常断开，false 为异常掉线；
 // 两种情况下订阅与未确认消息都保留，供重连恢复。连接是瞬时状态，不持久化。
+//
+// 与 Publish/Receive/Connect 同持 g.mu：在线状态的翻转与"按在线下发/拉取"
+// 的判定严格串行，并发掉线+下发不会出现"已掉线却按在线投递"的中间态。
+// 断开即作废本连接未取走的待取投递（设备不可能再取到它们）；对应消息仍在
+// 在途窗口中，重连时由 resumeLocked 统一重传，不重不丢。
 func (g *Gateway) Disconnect(deviceID string, graceful bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	g.sessions.Disconnect(deviceID, graceful)
+	delete(g.inbox, deviceID)
 }
 
 // ClearSession 主动清理会话：订阅作废、代次递增，与正常断开可区分；
@@ -246,7 +267,7 @@ func (g *Gateway) ResetIdentity(deviceID, newCredential string) (*Session, error
 	if err != nil {
 		return nil, err
 	}
-	g.trackers[deviceID] = newDeliveryTracker(g.cfg.AckWindow, g.cfg.Quota)
+	g.trackers[deviceID] = g.newTracker()
 	g.offline.ResetDevice(deviceID)
 	delete(g.inbox, deviceID)
 	// 先物理清空该设备的历史 WAL/快照（含损坏日志），再以全新日志记录 reset。
@@ -338,13 +359,17 @@ func (g *Gateway) Publish(deviceID, msgID, topic string, payload []byte) error {
 
 // Receive 设备拉取待收投递（含新消息、重传与离线补投）。
 // 设备离线时拒绝，返回 ErrCodeNotConnected。
+//
+// 在线判定与取件在同一把 g.mu 下原子完成：与 Disconnect/Connect 并发时，
+// 要么在断开前取走（设备当时确实在线），要么得到 NOT_CONNECTED，
+// 不存在"判定在线、取件时已离线"的中间态。
 func (g *Gateway) Receive(deviceID string) ([]Delivery, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	sess := g.sessions.Get(deviceID)
 	if sess == nil || !sess.Connected {
 		return nil, newError(ErrCodeNotConnected, "设备 %s 不在线", deviceID)
 	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
 	out := g.inbox[deviceID]
 	delete(g.inbox, deviceID)
 	return out, nil
@@ -398,6 +423,29 @@ func (g *Gateway) OfflineLen(deviceID string) int { return g.offline.Len(deviceI
 
 // OfflineEvicted 返回设备被淘汰的暂存消息总数（观测用）。
 func (g *Gateway) OfflineEvicted(deviceID string) int { return g.offline.Evicted(deviceID) }
+
+// ConsumedRetained 返回设备当前保留的"已消费"去重记录数（观测用）。
+// 该集合按 ConsumedCap 封顶，不会随运行时间无限增长。
+func (g *Gateway) ConsumedRetained(deviceID string) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	t, ok := g.trackers[deviceID]
+	if !ok {
+		return 0
+	}
+	return t.consumedCount()
+}
+
+// ConsumedEvicted 返回设备因超出 ConsumedCap 被淘汰的去重记录总数（观测用）。
+func (g *Gateway) ConsumedEvicted(deviceID string) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	t, ok := g.trackers[deviceID]
+	if !ok {
+		return 0
+	}
+	return t.consumedEvictedCount()
+}
 
 // Snapshot （兼容旧版）持久化离线暂存全量快照；使用 StateDir 时无需手工调用。
 func (g *Gateway) Snapshot() error { return g.offline.Snapshot() }
@@ -460,7 +508,7 @@ func (g *Gateway) recoverOneLocked(rd recoveredDevice, stats *RecoverStats) {
 		return
 	}
 
-	t := newDeliveryTracker(g.cfg.AckWindow, g.cfg.Quota)
+	t := g.newTracker()
 	g.trackers[deviceID] = t
 
 	if rd.state != nil {
@@ -506,6 +554,7 @@ func (g *Gateway) recoverOneLocked(rd recoveredDevice, stats *RecoverStats) {
 	stats.DevicesRecovered++
 	stats.InflightRecovered += t.inflightCount()
 	stats.ConsumedRetained += t.consumedCount()
+	stats.ConsumedEvicted += t.consumedEvictedCount()
 	stats.OfflineRecovered += g.offline.Len(deviceID)
 	stats.CorruptRecords += rd.corrupt
 }

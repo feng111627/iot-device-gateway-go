@@ -75,6 +75,7 @@ type RecoverStats struct {
 	OfflineRecovered    int      // 恢复的离线暂存消息数
 	InflightRecovered   int      // 恢复的在途未确认消息数
 	ConsumedRetained    int      // 恢复后保留的"已消费"去重记录数
+	ConsumedEvicted     int      // 恢复过程中因超出 ConsumedCap 被淘汰的去重记录数
 	CorruptRecords      int      // 损坏记录条数
 	FailedDevices       []string // 恢复失败被隔离的设备
 	SkippedDevices      []string // 因容量被挡住的设备

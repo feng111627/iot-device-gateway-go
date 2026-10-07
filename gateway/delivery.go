@@ -246,6 +246,13 @@ func (t *deliveryTracker) consumedCount() int {
 	return len(t.consumed)
 }
 
+// consumedEvictedCount 返回因超出保留上限被淘汰的去重记录数（观测用）。
+func (t *deliveryTracker) consumedEvictedCount() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.consumedEvicted
+}
+
 // snapshotState 导出全量状态（压缩时调用）。
 func (t *deliveryTracker) snapshotState() trackerSnapshot {
 	t.mu.Lock()

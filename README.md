@@ -75,6 +75,8 @@
 - `MaxDevices` 给出明确的设备数容量边界：恢复时按设备 ID 排序，超出部分不恢复并
   计入 `DevicesSkippedLimit`；运行期为新设备落盘同样受此边界约束（`DEVICE_LIMIT`）。
 - 离线暂存仍按设备容量封顶，满时确定性淘汰最旧消息（`OfflineEvicted` 可观测）。
+- "已消费"去重记录同样按设备隔离并按 `ConsumedCap` 封顶，超限确定性淘汰最旧
+  （见"投递保证"一节；`ConsumedRetained`/`ConsumedEvicted` 与恢复统计可观测）。
 
 ## 会话语义
 
@@ -85,11 +87,37 @@
   消息保留；`ClearSession(deviceID)` 使订阅作废、代次递增。
 - **身份相关**：见上一节"凭据平滑轮换 vs 换新身份"。
 
+### 并发掉线/重连时的语义
+
+在线状态翻转（`Connect`/`Disconnect`）与下发（`Publish`）、拉取（`Receive`）、
+确认（`Ack`）全部在同一把编排锁下串行，因此同一台设备上这些动作任意并发时：
+
+- **在线判断与实际一致**：`Publish` 看到的"在线/离线"就是落盘时的真实状态——
+  在线则进确认窗口并进入待取队列，离线则进离线暂存，不存在"已掉线却按在线投递"
+  或"已重连却拉不到补投"的中间态；`Receive` 的在线判定与取件原子完成，
+  设备离线时只能得到 `NOT_CONNECTED`。
+- **断开即作废未取走的待取投递**：连接断开（或新连接建立）时，旧连接上已下发但
+  设备尚未取走的投递被作废；对应消息仍在在途窗口中，由重连时的重传统一覆盖——
+  同一批消息不会在新连接的待取队列里重复出现，顺序也不被打乱。
+- **该重传、该补投的一条不少**：重连 = "按 Seq 升序重传在途 + 按入队顺序补投离线"，
+  每条消息最终恰好被设备消费一次（重传的重复投递由消息 ID 去重，是预期行为）。
+
 ## 投递保证
 
 - **恰好消费一次**：消息 ID 去重；重复 Ack 返回 `DUPLICATE_ACK` 且无副作用；
   已确认消息不会因重传或重启再次被消费。
 - **顺序稳定**：单设备维度分配单调递增的 `Seq`，投递（含重传、补投）按 Seq 顺序进行。
+- **去重记录容量边界**：`ConsumedCap` 给单设备"已消费"去重记录设定保留上限
+  （`<=0` 表示不限）。超限时**确定性地淘汰 Seq 最小（最旧）的记录**——被淘汰的只是
+  远超窗口/积压范围的历史确认记录，系统自身可能重传的消息一定仍在在途窗口内、
+  不受影响。被淘汰记录的重复 Ack 会返回 `UNKNOWN_MESSAGE` 而非 `DUPLICATE_ACK`
+  （去重记忆有界，这是明确的取舍）。可观测：
+  - 运行期：`ConsumedRetained(dev)`（当前保留数）、`ConsumedEvicted(dev)`（本进程
+    累计淘汰数，含恢复重放期间的淘汰）；
+  - 恢复结果：`RecoverStats.ConsumedRetained`（恢复后保留总数）、
+    `RecoverStats.ConsumedEvicted`（恢复/重放过程中淘汰的总数）。
+  恢复装载与事件重放同样执行淘汰规则，因此长期运行、反复重启后该集合也不会
+  无限增长。
 - **可区分的拒绝原因**（`gateway.Error.Code`）：
 
   | 错误码 | 含义 |
@@ -124,9 +152,16 @@ go test ./... -race -count=3         # 竞态检测 + 重复执行（并发恢�
   （轮换后订阅/在途/积压/已消费记录全部接续）、
   `TestCredential_ResetIdentityWipesEverythingAcrossRestart`
   （换新身份旧痕迹跨重启彻底不可见）、`TestCredential_RotateThenResetBoundaries`。
-- **并发与隔离**：`TestConcurrent_RecoveryAndRotationNoCrossTalk`（多设备并发恢复/轮换/
-  确认不串味，-race 口径）、`TestRecovery_CorruptDeviceIsQuarantined`（中部损坏隔离、
-  尾部撕裂自愈、换新身份解除隔离）、`TestRecovery_DeviceLimitAndStats`（容量边界与
-  恢复统计数字）。
+- **并发与隔离**：`TestConcurrent_ChurnSingleDeviceEventuallyConsistent`（同一设备
+  掉线/重连与下发/拉取/确认并发进行，最终每条消息恰好消费一次、批次内 Seq 单调）、
+  `TestConcurrent_MultiDeviceChurnIsolation`（多设备并发 churn 互不串味，单设备被
+  隔离时其余照常收敛）、`TestConcurrent_RecoveryAndRotationNoCrossTalk`（多设备并发
+  恢复/轮换/确认不串味，-race 口径）、`TestRecovery_CorruptDeviceIsQuarantined`
+  （中部损坏隔离、尾部撕裂自愈、换新身份解除隔离）、
+  `TestRecovery_DeviceLimitAndStats`（容量边界与恢复统计数字）。
+- **去重记录容量边界**：`TestConsumedCap_BoundedEvictOldest`（超限确定性淘汰最旧、
+  运行期与恢复统计可观测、跨重启仍封顶）、`TestConsumedCap_RecoveryStatsShowEvicted`
+  （恢复时按上限淘汰，保留/淘汰数体现在 RecoverStats）、
+  `TestConcurrent_ConsumedCapUnderChurn`（并发确认压力下任何时刻不越上限）。
 - **原有行为不回归**：会话（`TestSession_*`）、投递（`TestDelivery_*`）、
   离线（`TestOffline_*`，含旧版 `Snapshot/Restore` 兼容用例）全部保留通过。
