@@ -5,6 +5,11 @@ import (
 	"sync"
 )
 
+// defaultConsumedCap 是"已消费消息 ID 去重集"的默认单设备容量上限：
+// 长期运行、反复下发确认后该集合不再无限增长，超限确定性淘汰 Seq 最旧的记录。
+// 需要改变时显式配置 Config.ConsumedCap。
+const defaultConsumedCap = 1024
+
 // Config 网关配置。
 type Config struct {
 	AckWindow    int    // 单设备确认窗口（未确认消息上限）
@@ -14,6 +19,11 @@ type Config struct {
 	StateDir     string // 设备持久状态目录（WAL+快照），空则纯内存
 	MaxDevices   int    // 恢复/持久化的设备数容量边界，<=0 表示不限
 	CompactEvery int    // 每设备每累计多少条事件做一次快照压缩；<=0 不自动压缩
+	// ConsumedCap 单设备"已消费消息 ID 去重集"保留上限：
+	//   - 未配置（0）：取默认值 defaultConsumedCap；
+	//   - 正数：保留至多该数量的最旧记录，超出按 Seq 最旧优先确定性淘汰；
+	//   - 负数：不设上限（仅建议测试或确知生命周期很短的场景使用）。
+	ConsumedCap int
 }
 
 // deviceStateEnvelope 是压缩快照中的设备业务状态（见 durable.snapshotEnvelope.State）。
@@ -37,6 +47,7 @@ type Gateway struct {
 	trackers     map[string]*deliveryTracker // deviceID -> 投递跟踪器
 	inbox        map[string][]Delivery       // deviceID -> 待取投递（模拟本机连接，瞬时状态）
 	quarantined  map[string]bool             // 持久状态损坏、被隔离的设备
+	consumedCap  int                         // 去重集容量上限（构造时由配置归一化）
 	recoverStats RecoverStats
 }
 
@@ -44,6 +55,10 @@ func New(cfg Config) *Gateway {
 	compactEvery := cfg.CompactEvery
 	if compactEvery == 0 {
 		compactEvery = 256
+	}
+	consumedCap := cfg.ConsumedCap
+	if consumedCap == 0 {
+		consumedCap = defaultConsumedCap
 	}
 	return &Gateway{
 		cfg:         cfg,
@@ -53,13 +68,14 @@ func New(cfg Config) *Gateway {
 		trackers:    make(map[string]*deliveryTracker),
 		inbox:       make(map[string][]Delivery),
 		quarantined: make(map[string]bool),
+		consumedCap: consumedCap,
 	}
 }
 
 func (g *Gateway) tracker(deviceID string) *deliveryTracker {
 	t, ok := g.trackers[deviceID]
 	if !ok {
-		t = newDeliveryTracker(g.cfg.AckWindow, g.cfg.Quota)
+		t = newDeliveryTracker(g.cfg.AckWindow, g.cfg.Quota, g.consumedCap)
 		g.trackers[deviceID] = t
 	}
 	return t
@@ -120,8 +136,15 @@ func (g *Gateway) push(deviceID string, m Message) {
 
 // resumeLocked 在设备连接（含恢复后的重连）时：重传在途消息、补投离线暂存，
 // 每一步都先落盘（assign/drain），保证该过程被强杀后仍可接着恢复、不重不丢。
+// 调用方必须持有 g.mu。恢复动作与"标记在线"在同一把 g.mu 下原子完成，
+// 因此与掉线/下发/拉取并发时，任何外部观察者只会看到"离线且未补投"或
+// "在线且已补投"两种一致状态，不会看到中间态。
 func (g *Gateway) resumeLocked(sess *Session) {
 	deviceID := sess.DeviceID
+	// 新连接接管：作废上一段连接遗留的待取投递。它们对应的消息仍全部记录在
+	// 在途窗口/离线暂存中，下面会重新重传/补投，一条不少；丢弃旧批次可避免
+	// 与并发的重复 Connect 产生重复批次（同一连接周期内只下发一次）。
+	delete(g.inbox, deviceID)
 	t := g.tracker(deviceID)
 	// 1. 重传窗口内未确认的消息（顺序稳定）。重传不落新事件：assign 事件已在
 	// 落盘，Attempt 只是瞬时投递计数，重启后由持久化的 attempts 接续。
@@ -199,9 +222,19 @@ func (g *Gateway) Connect(deviceID, credential string) (*Session, error) {
 }
 
 // Disconnect 设备断开。graceful=true 为正常断开，false 为异常掉线；
-// 两种情况下订阅与未确认消息都保留，供重连恢复。连接是瞬时状态，不持久化。
+// 两种情况下订阅、在途未确认消息与离线暂存都保留，供重连恢复。连接是瞬时状态，不持久化。
+//
+// 并发语义：断开与 Connect/Publish/Receive 共用 g.mu 串行化，"置为离线"与
+// "作废当前连接待取队列"原子完成，因此并发的下发不会再把消息按在线路子推给一个
+// 已经掉线的设备，并发的拉取也不会拿到与状态判断相反的结果。待取队列中尚未被
+// 设备拉走的消息一律作废——它们早已占用在途窗口（assign 已落盘），重连时由
+// resumeLocked 按序重传；离线期间的新消息照常进离线暂存，所以不丢、不重、顺序不乱。
 func (g *Gateway) Disconnect(deviceID string, graceful bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	g.sessions.Disconnect(deviceID, graceful)
+	// 作废本段连接的待取投递；inflight 记录仍在，重连时统一重传。
+	delete(g.inbox, deviceID)
 }
 
 // ClearSession 主动清理会话：订阅作废、代次递增，与正常断开可区分；
@@ -246,7 +279,7 @@ func (g *Gateway) ResetIdentity(deviceID, newCredential string) (*Session, error
 	if err != nil {
 		return nil, err
 	}
-	g.trackers[deviceID] = newDeliveryTracker(g.cfg.AckWindow, g.cfg.Quota)
+	g.trackers[deviceID] = newDeliveryTracker(g.cfg.AckWindow, g.cfg.Quota, g.consumedCap)
 	g.offline.ResetDevice(deviceID)
 	delete(g.inbox, deviceID)
 	// 先物理清空该设备的历史 WAL/快照（含损坏日志），再以全新日志记录 reset。
@@ -338,13 +371,17 @@ func (g *Gateway) Publish(deviceID, msgID, topic string, payload []byte) error {
 
 // Receive 设备拉取待收投递（含新消息、重传与离线补投）。
 // 设备离线时拒绝，返回 ErrCodeNotConnected。
+//
+// 在线判断与摘取待取队列在同一把 g.mu 下原子完成：与掉线/重连并发时，
+// 要么在"仍在线"的判定下取走本连接周期的投递，要么在"已离线"时得到
+// NOT_CONNECTED 且一个都取不走，不会再出现判断与实际相反、消息被卡住的情况。
 func (g *Gateway) Receive(deviceID string) ([]Delivery, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	sess := g.sessions.Get(deviceID)
 	if sess == nil || !sess.Connected {
 		return nil, newError(ErrCodeNotConnected, "设备 %s 不在线", deviceID)
 	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
 	out := g.inbox[deviceID]
 	delete(g.inbox, deviceID)
 	return out, nil
@@ -398,6 +435,36 @@ func (g *Gateway) OfflineLen(deviceID string) int { return g.offline.Len(deviceI
 
 // OfflineEvicted 返回设备被淘汰的暂存消息总数（观测用）。
 func (g *Gateway) OfflineEvicted(deviceID string) int { return g.offline.Evicted(deviceID) }
+
+// ConsumedLen 返回设备当前保留的"已消费"去重记录数（观测用）。
+func (g *Gateway) ConsumedLen(deviceID string) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if t, ok := g.trackers[deviceID]; ok {
+		return t.consumedCount()
+	}
+	return 0
+}
+
+// ConsumedEvicted 返回设备"已消费"去重集因超过 ConsumedCap 被累计淘汰的记录数（观测用）。
+func (g *Gateway) ConsumedEvicted(deviceID string) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if t, ok := g.trackers[deviceID]; ok {
+		return t.consumedEvictedCount()
+	}
+	return 0
+}
+
+// InflightLen 返回设备当前在途未确认消息数（观测用）。
+func (g *Gateway) InflightLen(deviceID string) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if t, ok := g.trackers[deviceID]; ok {
+		return t.inflightCount()
+	}
+	return 0
+}
 
 // Snapshot （兼容旧版）持久化离线暂存全量快照；使用 StateDir 时无需手工调用。
 func (g *Gateway) Snapshot() error { return g.offline.Snapshot() }
@@ -460,7 +527,7 @@ func (g *Gateway) recoverOneLocked(rd recoveredDevice, stats *RecoverStats) {
 		return
 	}
 
-	t := newDeliveryTracker(g.cfg.AckWindow, g.cfg.Quota)
+	t := newDeliveryTracker(g.cfg.AckWindow, g.cfg.Quota, g.consumedCap)
 	g.trackers[deviceID] = t
 
 	if rd.state != nil {
@@ -476,7 +543,12 @@ func (g *Gateway) recoverOneLocked(rd recoveredDevice, stats *RecoverStats) {
 		if env.Tracker.Consumed == nil {
 			env.Tracker.Consumed = map[string]uint64{}
 		}
+		// 装载快照前记录累计淘汰基线；装载本身可能因当前进程容量更小而淘汰最旧记录。
+		evictedBefore := env.Tracker.Evicted
 		t.materializeState(&env.Tracker)
+		if d := t.consumedEvictedCount() - evictedBefore; d > 0 {
+			stats.ConsumedEvicted += d
+		}
 		if env.Offline != nil {
 			g.offline.MaterializeDevice(deviceID, *env.Offline)
 		}
@@ -484,6 +556,7 @@ func (g *Gateway) recoverOneLocked(rd recoveredDevice, stats *RecoverStats) {
 
 	// 2. 重放快照点之后的事件；全部幂等。
 	for _, rec := range rd.events {
+		evictedBefore := t.consumedEvictedCount()
 		switch rec.Type {
 		case evConnect, evSub, evRotate, evReset, evClear:
 			if rec.Type == evReset {
@@ -499,6 +572,10 @@ func (g *Gateway) recoverOneLocked(rd recoveredDevice, stats *RecoverStats) {
 			}
 		case evDrain:
 			g.offline.ApplyDrain(deviceID, rec.IDs)
+		}
+		// ack 重放把消息加入去重集，超限时新增的淘汰计入恢复结果（挡掉了多少）。
+		if d := t.consumedEvictedCount() - evictedBefore; d > 0 {
+			stats.ConsumedEvicted += d
 		}
 		stats.EventsReplayed++
 	}

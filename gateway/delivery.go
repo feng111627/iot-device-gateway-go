@@ -12,6 +12,7 @@ type trackerSnapshot struct {
 	Inflight map[string]Message `json:"inflight"`           // 在途未确认
 	Attempts map[string]int     `json:"attempts,omitempty"` // 在途消息已投递次数
 	Consumed map[string]uint64  `json:"consumed"`           // 已消费消息 ID -> Seq（去重集）
+	Evicted  int                `json:"consumed_evicted"`   // 去重集因超上限累计淘汰的记录数（跨重启保留观测）
 }
 
 // deliveryTracker 跟踪单设备的下发窗口、顺序与去重。
@@ -28,23 +29,22 @@ type deliveryTracker struct {
 	used            int
 }
 
-func newDeliveryTracker(window, quota int) *deliveryTracker {
+func newDeliveryTracker(window, quota, consumedCap int) *deliveryTracker {
 	return &deliveryTracker{
 		window:      window,
 		quota:       quota,
 		inflight:    make(map[string]Message),
 		attempts:    make(map[string]int),
 		consumed:    make(map[string]uint64),
-		consumedCap: 0,
+		consumedCap: consumedCap,
 	}
 }
 
-// setConsumedCap 设置已消费去重集保留上限（恢复后/创建时由编排层统一配置）。
-func (t *deliveryTracker) setConsumedCap(cap int) {
+// consumedCount / consumedEvictedCount 供编排层观测与恢复统计使用。
+func (t *deliveryTracker) consumedEvictedCount() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.consumedCap = cap
-	t.evictConsumedLocked()
+	return t.consumedEvicted
 }
 
 // precheckAssign 只做占用前的校验，不产生任何状态变更（供"先落盘再改内存"）。
@@ -170,7 +170,8 @@ func (t *deliveryTracker) ack(msgID string) error {
 	return nil
 }
 
-// evictConsumedLocked 在已消费去重集超限时，确定性地移除 Seq 最小（最旧）的记录。
+// evictConsumedLocked 在已消费去重集超限时，确定性地移除 Seq 最小（最旧）的记录；
+// Seq 相同（理论上不会发生）时按消息 ID 字典序兜底，保证淘汰结果确定可解释。
 // 注：系统自身重传的消息一定仍在在途集合中，被移除的只是远超窗口/积压范围的
 // 历史确认记录；该上界提供明确容量边界，移除计数可观测。
 func (t *deliveryTracker) evictConsumedLocked() {
@@ -180,9 +181,11 @@ func (t *deliveryTracker) evictConsumedLocked() {
 	for len(t.consumed) > t.consumedCap {
 		var oldestID string
 		var oldestSeq uint64
+		first := true
 		for id, seq := range t.consumed {
-			if oldestID == "" || seq < oldestSeq {
+			if first || seq < oldestSeq || (seq == oldestSeq && id < oldestID) {
 				oldestID, oldestSeq = id, seq
+				first = false
 			}
 		}
 		delete(t.consumed, oldestID)
@@ -222,7 +225,7 @@ func (t *deliveryTracker) resetQuota() {
 	t.used = 0
 }
 
-// reset 清空全部投递状态（换新身份时使用）：在途、已消费、序号与配额全部归零。
+// reset 清空全部投递状态（换新身份时使用）：在途、已消费、序号、配额与淘汰计数全部归零。
 func (t *deliveryTracker) reset() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -231,6 +234,7 @@ func (t *deliveryTracker) reset() {
 	t.inflight = make(map[string]Message)
 	t.attempts = make(map[string]int)
 	t.consumed = make(map[string]uint64)
+	t.consumedEvicted = 0
 }
 
 // inflightCount / consumedCount 供编排层恢复统计使用。
@@ -266,6 +270,7 @@ func (t *deliveryTracker) snapshotState() trackerSnapshot {
 	for id, seq := range t.consumed {
 		snap.Consumed[id] = seq
 	}
+	snap.Evicted = t.consumedEvicted
 	return snap
 }
 
@@ -287,6 +292,9 @@ func (t *deliveryTracker) materializeState(snap *trackerSnapshot) {
 	for id, seq := range snap.Consumed {
 		t.consumed[id] = seq
 	}
+	// 累计淘汰数随快照接续；若快照装载后已超限，本次装载额外淘汰的数量继续累加，
+	// 编排层可通过 materialize 前后的差值统计"恢复时挡掉了多少"。
+	t.consumedEvicted = snap.Evicted
 	t.evictConsumedLocked()
 }
 
